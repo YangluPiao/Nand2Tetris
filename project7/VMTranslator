@@ -1,0 +1,254 @@
+#!/usr/bin/python3
+import os, glob, sys, re, textwrap
+
+def info(msg):
+    print("[INFO] %s"%msg)
+
+def error(msg):
+    print("[ERROR] %s"%msg)
+    sys.exit(-1)
+
+def die(cond, msg):
+    if not cond:
+        error(msg)
+
+def parse_vm(file_path):
+    all_commands = []
+    with open(file_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("//") or not line: continue
+            all_commands.append(line.split(' '))
+    return all_commands
+
+def wr(f, msg):
+    line = "%s\n"%msg.strip()
+    print(line, end='')
+    f.write(line)
+
+def translate(file_path, all_commands):
+    name = os.path.split(file_path)
+    file_basename = os.path.splitext(name[1])[0]
+    am_file_name = os.path.join(name[0], file_basename + ".asm")
+    segment_map = {
+            "local": "LCL",
+            "argument": "ARG",
+            "this": "THIS",
+            "that": "THAT",
+            "temp": "5",
+            # for pointer:
+            "0"   : "THIS",
+            "1"   : "THAT",
+    }
+    skip_label = 0
+    with open(am_file_name, 'w') as f:
+        for cmd in all_commands:
+            # print the input VM command as comment
+            wr(f, "///////////////// %s ////////////////"%(" ".join(cmd)))
+            if len(cmd) > 1:
+                die(len(cmd) == 3, "unknown command '%s'"%cmd)
+                act = cmd[0]
+                seg = cmd[1]
+                arg = cmd[2]
+                if seg == "constant":
+                    # *SP=arg; SP++;
+                    die(act == "push", "only push is an valid action for constant")
+                    content = textwrap.dedent("""
+                        @%s
+                        D=A
+                        @SP
+                        A=M
+                        M=D //  *SP = x;
+                        @SP
+                        M=M+1 // SP++"""%arg)
+                elif seg in ["local", "argument", "this", "that", "temp"]:
+                    # addr=segment+i;
+                    content = textwrap.dedent("""
+                        @%s
+                        D=A
+                        @%s
+                        D=%s+D
+                        @addr
+                        M=D // addr = %s + i"""%(
+                            arg,
+                            segment_map[seg],
+                            ("A" if seg == "temp" else "M"),
+                            segment_map[seg]))
+                    if act == "pop":
+                        # SP--; *addr=*SP
+                        content += textwrap.dedent("""
+                            @SP
+                            M=M-1 // SP--
+                            A=M
+                            D=M
+                            @addr
+                            A=M
+                            M=D // *addr=*SP""")
+                    elif act == "push":
+                        # *SP=*addr; SP++;
+                        content += textwrap.dedent("""
+                            A=M
+                            D=M
+                            @SP
+                            A=M
+                            M=D  // *SP = *addr
+                            @SP
+                            M=M+1 // SP++""")
+                    else:
+                        error("unknown act '%s'"%act)
+                elif seg in ["pointer", "static"]:
+                    if act == "push":
+                        # *SP = THIS/THAT/file_basename.x; SP++;
+                        content = textwrap.dedent("""
+                            D=M
+                            @SP
+                            A=M
+                            M=D
+                            @SP
+                            M=M+1 // SP++
+                            """)
+                        if seg == "pointer":
+                            content = textwrap.dedent("""
+                                @%s // *SP = THIS/THAT
+                                %s"""%(segment_map[arg], content))
+                        else: # static
+                            register = "%s.%s"%(file_basename, arg)
+                            content = textwrap.dedent("""
+                                @%s // *SP = file_basename.x
+                                %s"""%(register, content))
+                    elif act == "pop":
+                        # SP--; THIS/THAT/file_basename.x=*SP;
+                        content = textwrap.dedent("""
+                            @SP
+                            M=M-1 // SP--
+                            A=M
+                            D=M""")
+                        if seg == "pointer":
+                            content += textwrap.dedent("""
+                                @%s
+                                M=D // THIS/THAT=*SP
+                                """%segment_map[arg])
+                        else: # static
+                            register = "%s.%s"%(file_basename, arg)
+                            content += textwrap.dedent("""
+                                @%s
+                                M=D // file_basename.x=*SP
+                                """%register)
+                    else:
+                        error("unknown act '%s'"%act)
+                else:
+                    error("unknown segment '%s'"%seg)
+            elif len(cmd) == 1: # operations, e.g. add
+                op = cmd[0]
+                # SP--; y = *SP
+                content = textwrap.dedent("""
+                    @SP
+                    M=M-1 // SP--
+                    @SP
+                    A=M
+                    D=M
+                    @y
+                    M=D // y = *SP""")
+                if op in ["neg", "not"]: # unary op
+                    if op == "neg":
+                        content += textwrap.dedent("""
+                            @y
+                            M=-M""")
+                    elif op == "not":
+                        content += textwrap.dedent("""
+                            @y
+                            M=!M""")
+                    else:
+                        error("unknown op '%s'"%op)
+                else: # binary op
+                    # SP--; y = *SP
+                    content += textwrap.dedent("""
+                        @SP
+                        M=M-1 // SP--
+                        @SP
+                        A=M
+                        D=M
+                        @x
+                        M=D // x = *SP
+                        @y
+                        D=M""") # now D is 'y'
+                    if op == "add":
+                        # x=x+y *SP=x;
+                        content += textwrap.dedent("""
+                            @x
+                            M=M+D // x = x + y""")
+                    elif op == "sub":
+                        # x=x-y; *SP=x;
+                        content += textwrap.dedent("""
+                            @x
+                            M=M-D // x = x - y""")
+                    elif op in ["gt", "lt", "eq"]:
+                        if op == "gt":
+                            # x = (x > y ? -1 : 0)
+                            content += textwrap.dedent("""
+                                @x
+                                M=M-D
+                                D=M
+                                @x
+                                M=-1
+                                @skip%d // if x > y, skip setting 0
+                                D;JGT"""%skip_label)
+                        elif op == "lt":
+                            # x = (x < y ? -1 : 0)
+                            content += textwrap.dedent("""
+                                @x
+                                M=M-D
+                                D=M
+                                @x
+                                M=-1
+                                @skip%d // if x < y, skip setting 0
+                                D;JLT"""%skip_label)
+                        elif op == "eq":
+                            # x = (x == y ? -1 : 0)
+                            content += textwrap.dedent("""
+                                @x
+                                M=M-D
+                                D=M
+                                @x
+                                M=-1
+                                @skip%d // if x == y, skip setting 0
+                                D;JEQ"""%skip_label)
+                        content += textwrap.dedent("""
+                            @x
+                            M=0
+                            (skip%d)
+                            @x
+                            """%(skip_label))
+                        skip_label += 1
+                    elif op == "and":
+                        # x=(x&y);
+                        content += textwrap.dedent("""
+                            @x
+                            M=M&D // x = (x&y)
+                            """)
+                    elif op == "or":
+                        # x=(x|y); *SP=x;
+                        content += textwrap.dedent("""
+                            @x
+                            M=M|D // x = (x|y)
+                            """)
+                    else:
+                      error("unknown op '%s'"%op)
+                # *SP = x/y; SP++
+                content += textwrap.dedent("""
+                    D=M
+                    @SP
+                    A=M
+                    M=D // *SP=y(for unary)/x(for binary)
+                    @SP
+                    M=M+1""")
+            wr(f, content)
+
+def main(file_path):
+    all_commands = parse_vm(file_path)
+    translate(file_path, all_commands)
+
+if __name__ == "__main__":
+    file_path = sys.argv[1]
+    die(os.path.isfile(file_path), "'%s' does not exist"%file_path)
+    main(file_path)
